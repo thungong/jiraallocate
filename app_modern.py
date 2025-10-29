@@ -350,11 +350,12 @@ if 'uploaded_files' not in st.session_state:
         'csv_file': None,
         'pdf_content': None,
         'users_data': None,
-        'allocation_result': None,
-        'summary_result': None
+        'include_vat': False,  # Default to exclude VAT (older format)
+        'allocation_result': None,  # Cache for allocation results
+        'summary_result': None,     # Cache for summary results
     }
 
-def extract_invoice_items(text):
+def extract_invoice_items(text, include_vat=False):
     items = [
         ("Confluence", 30),
         ("draw.io Diagrams |", 30),
@@ -368,10 +369,20 @@ def extract_invoice_items(text):
     for name, default_count in items:
         for line in lines:
             if name.lower() in line.lower():
-                match = re.search(r"USD\s*([\d,]+\.\d{2})", line)
                 amount = None
-                if match:
-                    amount = float(match.group(1).replace(',', ''))
+                if include_vat:
+                    # For new format with VAT: look for 'Amount' column (includes VAT)
+                    # Pattern looks for: USD XXX.XX at the end of line (final amount column)
+                    matches = re.findall(r"USD\s*([\d,]+\.\d{2})", line)
+                    if matches:
+                        # Take the last USD amount (rightmost column = Amount with VAT)
+                        amount = float(matches[-1].replace(',', ''))
+                else:
+                    # For old format: look for any USD amount (Amount excl. tax)
+                    match = re.search(r"USD\s*([\d,]+\.\d{2})", line)
+                    if match:
+                        amount = float(match.group(1).replace(',', ''))
+                
                 found.append({
                     "desc": name,
                     "amount": amount,
@@ -639,12 +650,20 @@ elif page == "💰 Expense Allocation":
     
     with col1:
         pdf_file = st.file_uploader("📄 Invoice PDF", type=["pdf"], key="pdf_file")
+        # VAT Toggle
+        include_vat = st.checkbox(
+            "💰 Include VAT in calculations", 
+            value=False,
+            help="Check this if your PDF has a separate 'Amount' column with VAT included. Uncheck for older PDFs with only 'Amount excl. tax'."
+        )
         # Store in session state
         if pdf_file is not None:
             st.session_state.uploaded_files['pdf_file'] = pdf_file.name
             st.session_state.uploaded_files['pdf_content'] = pdf_file.read()
             # Reset file pointer for processing
             pdf_file.seek(0)
+        # Store VAT preference in session state
+        st.session_state.uploaded_files['include_vat'] = include_vat
     
     with col2:
         csv_file = st.file_uploader("👥 Users CSV", type=["csv"], key="csv_file") 
@@ -724,8 +743,14 @@ elif page == "💰 Expense Allocation":
         
         # Only process if not cached
         if st.session_state.uploaded_files['allocation_result'] is None:
-            # Extract product items
-            product_items = extract_invoice_items(text)
+            # Extract product items with VAT setting
+            include_vat = st.session_state.uploaded_files.get('include_vat', False)
+            product_items = extract_invoice_items(text, include_vat)
+            
+            # Show calculation mode
+            vat_mode = "Include VAT" if include_vat else "Exclude VAT"
+            st.info(f"📊 **Calculation Mode:** {vat_mode} - Using {'final Amount column' if include_vat else 'Amount excl. tax column'}")
+            
             missing = [i for i in product_items if i['amount'] is None]
             
             # Manual input for missing amounts
@@ -849,6 +874,13 @@ elif page == "💰 Expense Allocation":
         
         st.markdown("### 📊 Allocation Results")
         st.success("✅ Allocation data available!")
+        
+        # Show calculation summary
+        include_vat = st.session_state.uploaded_files.get('include_vat', False)
+        if include_vat:
+            st.info("💰 **Calculation includes VAT** - Using final Amount column from invoice")
+        else:
+            st.info("💰 **Calculation excludes VAT** - Using Amount excl. tax column from invoice")
         
         st.markdown("**Preview (first 10 rows):**")
         st.dataframe(output_df.head(10), hide_index=True, use_container_width=True)
