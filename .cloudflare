@@ -1,0 +1,11 @@
+# Cloudflare Pages Configuration
+
+# For Cloudflare Pages, we need to use Functions
+# Since this is a Streamlit app, we'll provide instructions for deployment
+
+# Build Command (not applicable for Streamlit)
+# Build Output Directory: dist
+
+# Environment Variables needed:
+# PYTHON_VERSION=3.9
+# NODE_VERSION=18
