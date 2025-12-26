@@ -36,6 +36,7 @@ This project contains multiple versions of a Jira allocation application with di
    ```bash
    streamlit run app_modern.py
    ```
+   หรือ /Users/aeythungong/Documents/AEY/Python-Projects/Jira-Allocations/.venv/bin/streamlit run app_modern.py
 
 4. Open your browser to `http://localhost:8501`
 

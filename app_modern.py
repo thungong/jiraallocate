@@ -356,42 +356,220 @@ if 'uploaded_files' not in st.session_state:
     }
 
 def extract_invoice_items(text, include_vat=False):
-    items = [
-        ("Confluence", 30),
-        ("draw.io Diagrams |", 30),
-        ("Flowchart & PlantUML", 30),
-        ("Jira Service", 14),
-        ("Jira, Standard", 52),
-        ("draw.io Diagrams for", 52),
-    ]
+    """
+    Enhanced invoice item extraction - extracts ALL line items from invoice.
+    No longer limited to predefined products.
+    """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     found = []
-    for name, default_count in items:
-        for line in lines:
-            if name.lower() in line.lower():
-                amount = None
+    
+    # Pattern to identify product lines (lines with USD amounts and product info)
+    # Typically: Product Name ... USD XX.XX ... USD XX.XX (optional)
+    for line in lines:
+        # Skip header lines, total lines, etc.
+        if any(skip in line.lower() for skip in ['description', 'total', 'subtotal', 'amount due', 'balance']):
+            continue
+        
+        # Look for lines with USD amounts
+        matches = re.findall(r"USD\s*([\d,]+\.\d{2})", line)
+        
+        if matches and len(matches) >= 1:
+            # This looks like a product line
+            # Extract product name (text before first USD)
+            product_name_match = re.match(r"^(.+?)\s+USD", line)
+            if product_name_match:
+                product_name = product_name_match.group(1).strip()
+                
+                # Skip if it's clearly not a product line
+                if len(product_name) < 3 or product_name.isdigit():
+                    continue
+                
+                # Extract amount based on VAT setting
+                amounts = [float(m.replace(',', '')) for m in matches]
+                
                 if include_vat:
-                    # For new format with VAT: look for 'Amount' column (includes VAT)
-                    # Pattern looks for: USD XXX.XX at the end of line (final amount column)
-                    matches = re.findall(r"USD\s*([\d,]+\.\d{2})", line)
-                    if matches:
-                        # Take the last USD amount (rightmost column = Amount with VAT)
-                        amount = float(matches[-1].replace(',', ''))
+                    # For new format with VAT: take the LAST amount (rightmost = total with VAT)
+                    amount = amounts[-1]
                 else:
-                    # For old format: look for any USD amount (Amount excl. tax)
-                    match = re.search(r"USD\s*([\d,]+\.\d{2})", line)
-                    if match:
-                        amount = float(match.group(1).replace(',', ''))
+                    # For old format: take the FIRST amount (Amount excl. tax)
+                    amount = amounts[0]
+                
+                # Try to extract quantity/user count if present
+                # Look for patterns like: "x 30" or "30 users" or just a number
+                count_match = re.search(r'[xX×]\s*(\d+)|(\d+)\s*user', line)
+                count = int(count_match.group(1) or count_match.group(2)) if count_match else 1
                 
                 found.append({
-                    "desc": name,
+                    "desc": product_name,
                     "amount": amount,
-                    "count": default_count,
+                    "count": count,
                 })
-                break
-        else:
-            found.append({"desc": name, "amount": None, "count": default_count})
+    
     return found
+
+
+def extract_invoice_items_from_tables(pdf_file, include_vat=False):
+    """
+    Advanced extraction using pdfplumber's table detection.
+    Extracts ALL line items from invoice tables dynamically.
+    """
+    found = []
+    
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                # Extract tables from the page
+                tables = page.extract_tables()
+                
+                if not tables:
+                    continue
+                
+                for table in tables:
+                    # Skip empty tables
+                    if not table or len(table) < 2:
+                        continue
+                    
+                    # Identify columns
+                    header_row = table[0] if table else []
+                    desc_col_idx = None
+                    amount_col_idx = None
+                    qty_col_idx = None
+                    
+                    # Find column indices by header names
+                    for idx, cell in enumerate(header_row):
+                        if cell and isinstance(cell, str):
+                            cell_lower = cell.lower()
+                            
+                            # Find description column
+                            if desc_col_idx is None and any(term in cell_lower for term in ['description', 'product', 'item']):
+                                desc_col_idx = idx
+                            
+                            # Find quantity column
+                            if qty_col_idx is None and any(term in cell_lower for term in ['quantity', 'qty', 'users']):
+                                qty_col_idx = idx
+                            
+                            # Find amount column based on VAT setting
+                            if include_vat:
+                                # Look for total/amount column (rightmost amount column with VAT)
+                                if 'amount' in cell_lower and 'excl' not in cell_lower:
+                                    amount_col_idx = idx
+                            else:
+                                # Look for amount excl. tax
+                                if 'amount' in cell_lower and 'excl' in cell_lower:
+                                    amount_col_idx = idx
+                    
+                    # Auto-detect columns if headers don't match
+                    if desc_col_idx is None:
+                        desc_col_idx = 0  # First column is usually description
+                    
+                    if amount_col_idx is None and len(header_row) > 0:
+                        # Find rightmost column with USD amounts
+                        # For include_vat=True, we want the rightmost amount column
+                        # For include_vat=False, we want the first amount column (if multiple exist)
+                        amount_columns = []
+                        for row in table[1:]:
+                            for idx in range(len(row)):
+                                cell = row[idx] if idx < len(row) else None
+                                if cell and re.search(r'USD|[\d,]+\.\d{2}', str(cell)):
+                                    if idx not in amount_columns:
+                                        amount_columns.append(idx)
+                            if amount_columns:
+                                break
+                        
+                        if amount_columns:
+                            if include_vat:
+                                # Use rightmost (last) amount column
+                                amount_col_idx = amount_columns[-1]
+                            else:
+                                # Use leftmost (first) amount column
+                                amount_col_idx = amount_columns[0]
+                    
+                    # Extract all product rows
+                    for row_idx, row in enumerate(table[1:], 1):  # Skip header row
+                        if not row or len(row) <= desc_col_idx:
+                            continue
+                        
+                        # Get description
+                        desc_cell = row[desc_col_idx] if desc_col_idx < len(row) else None
+                        if not desc_cell:
+                            continue
+                        
+                        desc = str(desc_cell).strip()
+                        
+                        # Skip non-product rows (totals, headers, empty)
+                        if not desc or len(desc) < 3:
+                            continue
+                        if any(skip in desc.lower() for skip in ['total', 'subtotal', 'amount due', 'description']):
+                            continue
+                        
+                        # Get amount
+                        amount = None
+                        if amount_col_idx is not None and amount_col_idx < len(row):
+                            cell_value = row[amount_col_idx]
+                            if cell_value:
+                                # Extract numeric value (handle both "USD XXX.XX" and "XXX.XX" formats)
+                                match = re.search(r'([\d,]+\.\d{2})', str(cell_value))
+                                if match:
+                                    amount = float(match.group(1).replace(',', ''))
+                        
+                        # Get quantity/user count
+                        count = 1
+                        if qty_col_idx is not None and qty_col_idx < len(row):
+                            qty_cell = row[qty_col_idx]
+                            if qty_cell:
+                                qty_match = re.search(r'(\d+)', str(qty_cell))
+                                if qty_match:
+                                    count = int(qty_match.group(1))
+                        
+                        # Add to results if we have both description and amount
+                        if desc and amount is not None:
+                            found.append({
+                                "desc": desc,
+                                "amount": amount,
+                                "count": count,
+                            })
+    
+    except Exception as e:
+        # If table extraction fails, return empty results
+        # The fallback text extraction will be used
+        import traceback
+        print(f"Table extraction error: {e}")
+        traceback.print_exc()
+    
+    return found
+
+def show_extraction_debug_info(product_items, text_preview=""):
+    """
+    Display detailed extraction results for debugging and transparency.
+    """
+    st.markdown("### 🔍 Extraction Details")
+    
+    extraction_df = pd.DataFrame(product_items)
+    extraction_df['Status'] = extraction_df['amount'].apply(
+        lambda x: '✅ Found' if x is not None else '❌ Missing'
+    )
+    extraction_df['Amount (USD)'] = extraction_df['amount'].apply(
+        lambda x: f"${x:,.2f}" if x is not None else "N/A"
+    )
+    
+    display_df = extraction_df[['desc', 'Status', 'Amount (USD)', 'count']].copy()
+    display_df.columns = ['Product', 'Status', 'Amount', 'User Count']
+    
+    st.dataframe(display_df, width="stretch")
+    
+    # Summary statistics
+    found_count = sum(1 for item in product_items if item['amount'] is not None)
+    total_count = len(product_items)
+    success_rate = (found_count / total_count * 100) if total_count > 0 else 0
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Found", f"{found_count}/{total_count}")
+    with col2:
+        st.metric("Success Rate", f"{success_rate:.0f}%")
+    with col3:
+        total_amount = sum(item['amount'] for item in product_items if item['amount'] is not None)
+        st.metric("Total Extracted", f"${total_amount:,.2f}")
 
 def rounding_safe_split(total, n):
     per_user = total / n
@@ -474,7 +652,7 @@ if page == "👥 BU Mapping Management":
     edited_df = st.data_editor(
         bu_df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         key="bu_editor",
         height=400,  # Set fixed height to show more rows
         hide_index=False,  # Keep index visible for debugging
@@ -511,7 +689,7 @@ if page == "👥 BU Mapping Management":
     # Save options - prominent and clear
     col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
     with col1:
-        if st.button("💾 **Save Changes**", use_container_width=True, type="primary", disabled=not data_changed):
+        if st.button("💾 **Save Changes**", width="stretch", type="primary", disabled=not data_changed):
             try:
                 # Save to Excel directly in current directory
                 edited_df.to_excel(PERSIST_FILE, index=False)
@@ -527,11 +705,11 @@ if page == "👥 BU Mapping Management":
                 st.error(f"❌ **Save failed:** {str(e)}")
                 
     with col2:
-        if st.button("🔄 **Reset to Last Saved**", use_container_width=True, disabled=not data_changed):
+        if st.button("🔄 **Reset to Last Saved**", width="stretch", disabled=not data_changed):
             st.rerun()
             
     with col3:
-        if st.button("📥 **Export Excel**", use_container_width=True):
+        if st.button("📥 **Export Excel**", width="stretch"):
             try:
                 # Create a temporary file for download
                 buffer = io.BytesIO()
@@ -543,7 +721,7 @@ if page == "👥 BU Mapping Management":
                     data=buffer.getvalue(),
                     file_name=f"bu_mapping_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    width="stretch"
                 )
             except Exception as e:
                 st.error(f"❌ Export failed: {str(e)}")
@@ -653,7 +831,7 @@ elif page == "💰 Expense Allocation":
         # VAT Toggle
         include_vat = st.checkbox(
             "💰 Include VAT in calculations", 
-            value=False,
+            value=True,
             help="Check this if your PDF has a separate 'Amount' column with VAT included. Uncheck for older PDFs with only 'Amount excl. tax'."
         )
         # Store in session state
@@ -721,7 +899,10 @@ elif page == "💰 Expense Allocation":
             with st.spinner("Extracting text from PDF..."):
                 if pdf_file is not None:
                     # Use newly uploaded file
-                    with pdfplumber.open(pdf_file) as pdf:
+                    pdf_bytes = io.BytesIO(pdf_file.read())
+                    pdf_file.seek(0)  # Reset for potential reuse
+                    
+                    with pdfplumber.open(pdf_bytes) as pdf:
                         text = ''
                         for page in pdf.pages:
                             page_text = page.extract_text()
@@ -729,7 +910,6 @@ elif page == "💰 Expense Allocation":
                                 text += page_text + '\n'
                 else:
                     # Use session state data
-                    import io
                     pdf_bytes = io.BytesIO(st.session_state.uploaded_files['pdf_content'])
                     with pdfplumber.open(pdf_bytes) as pdf:
                         text = ''
@@ -743,13 +923,53 @@ elif page == "💰 Expense Allocation":
         
         # Only process if not cached
         if st.session_state.uploaded_files['allocation_result'] is None:
-            # Extract product items with VAT setting
+            # Extract product items with smart multi-method extraction
             include_vat = st.session_state.uploaded_files.get('include_vat', False)
-            product_items = extract_invoice_items(text, include_vat)
             
-            # Show calculation mode
+            # Method 1: Try table extraction first (more accurate)
+            st.info("🔍 **Smart Extraction:** Analyzing PDF structure...")
+            
+            # Reset pdf_bytes for table extraction
+            if pdf_file is not None:
+                pdf_bytes = io.BytesIO(pdf_file.read())
+                pdf_file.seek(0)
+            else:
+                pdf_bytes = io.BytesIO(st.session_state.uploaded_files['pdf_content'])
+            
+            product_items = extract_invoice_items_from_tables(pdf_bytes, include_vat)
+            
+            # Method 2: Fallback to text extraction for items not found
+            items_found_by_table = sum(1 for item in product_items if item['amount'] is not None)
+            if items_found_by_table < len(product_items):
+                st.info(f"🔄 **Hybrid Extraction:** Found {items_found_by_table}/{len(product_items)} items via table, using text extraction for remaining...")
+                text_items = extract_invoice_items(text, include_vat)
+                
+                # Merge results: prefer table extraction, use text extraction as fallback
+                for i, item in enumerate(product_items):
+                    if item['amount'] is None and i < len(text_items):
+                        product_items[i]['amount'] = text_items[i]['amount']
+            else:
+                st.success(f"✅ **Table Extraction Successful:** Found all {items_found_by_table} product amounts")
+            
+            # Show calculation mode with detailed explanation
             vat_mode = "Include VAT" if include_vat else "Exclude VAT"
-            st.info(f"📊 **Calculation Mode:** {vat_mode} - Using {'final Amount column' if include_vat else 'Amount excl. tax column'}")
+            if include_vat:
+                st.info(f"📊 **Calculation Mode: {vat_mode}** ✅\n"
+                       f"- Using **rightmost/final Amount column** (includes VAT)\n"
+                       f"- For invoices with multiple amount columns, this selects the total with tax")
+            else:
+                st.info(f"📊 **Calculation Mode: {vat_mode}** \n"
+                       f"- Using **Amount excl. tax column** (excludes VAT)\n"
+                       f"- For invoices with multiple amount columns, this selects the amount without tax")
+            
+            # Show detailed extraction results
+            with st.expander("🔍 View Extraction Details", expanded=False):
+                show_extraction_debug_info(product_items, text[:500])
+            
+            # Display invoice total summary
+            total_extracted = sum(item['amount'] for item in product_items if item['amount'] is not None)
+            total_items = len(product_items)
+            st.success(f"📋 **Invoice Summary:** {total_items} line items | **Total Amount:** ${total_extracted:,.2f}")
             
             missing = [i for i in product_items if i['amount'] is None]
             
@@ -770,9 +990,6 @@ elif page == "💰 Expense Allocation":
                 if any(i['amount'] is None or i['amount']==0 for i in product_items):
                     st.info("🔄 Please enter all missing amounts to continue.")
                     st.stop()
-
-            # Use real product names for output
-            product_names = [p['desc'] for p in product_items]
 
             # Load Users (from uploaded file or session)
             st.markdown("### 👥 Processing Users...")
@@ -828,38 +1045,58 @@ elif page == "💰 Expense Allocation":
             it_users = merged[merged['Cost To'].str.upper() == "IT"]
             num_it_users = len(it_users)
 
-            # Rounding-safe allocations
-            alloc_shares = {}
-            for idx in [0, 1, 2, 4, 5]:
-                alloc_shares[product_names[idx]] = rounding_safe_split(product_items[idx]['amount'], total_users)
+            # Prepare dynamic allocation columns
+            # Each product can have different user count and allocation rules
+            allocation_columns = {}
+            
+            for product in product_items:
+                product_name = product['desc']
+                product_amount = product['amount']
+                product_count = product.get('count', total_users)  # Default to total users if not specified
+                
+                # Check if this is a Jira Service-like product (IT only)
+                # Detect by keywords in product name
+                is_it_only = any(keyword in product_name.lower() for keyword in ['jira service', 'service management'])
+                
+                if is_it_only and num_it_users > 0:
+                    # Allocate only to IT users
+                    shares = [0.00] * total_users
+                    shares_for_it = rounding_safe_split(product_amount, num_it_users)
+                    it_idx = merged["Cost To"].str.upper() == "IT"
+                    share_iter = iter(shares_for_it)
+                    for i in range(total_users):
+                        if it_idx.iloc[i]:
+                            shares[i] = next(share_iter)
+                    allocation_columns[product_name] = shares
+                else:
+                    # Allocate to all users or specific count
+                    # If product_count matches total_users, allocate evenly to all
+                    # Otherwise, allocate to first N users (or adjust as needed)
+                    if product_count >= total_users or product_count == 1:
+                        # Allocate evenly to all users
+                        allocation_columns[product_name] = rounding_safe_split(product_amount, total_users)
+                    else:
+                        # Allocate to subset of users (first N users that match criteria)
+                        # For now, allocate evenly to all - can be customized later
+                        allocation_columns[product_name] = rounding_safe_split(product_amount, total_users)
 
-            # Jira Service (IT only)
-            inv4_shares = [0.00] * total_users
-            if num_it_users > 0:
-                shares_for_it = rounding_safe_split(product_items[3]['amount'], num_it_users)
-                it_idx = merged["Cost To"].str.upper() == "IT"
-                share_iter = iter(shares_for_it)
-                for i in range(total_users):
-                    if it_idx.iloc[i]:
-                        inv4_shares[i] = next(share_iter)
-
-            # Create output DataFrame
-            output_df = pd.DataFrame({
+            # Create output DataFrame dynamically
+            output_data = {
                 "User name": merged["User name_x"] if "User name_x" in merged.columns else merged["User name"],
                 "Email": merged["email"],
                 "Cost To": merged["Cost To"],
-                product_names[0]: alloc_shares[product_names[0]],
-                product_names[1]: alloc_shares[product_names[1]],
-                product_names[2]: alloc_shares[product_names[2]],
-                product_names[3]: inv4_shares,
-                product_names[4]: alloc_shares[product_names[4]],
-                product_names[5]: alloc_shares[product_names[5]],
-            })
+            }
+            
+            # Add all product columns
+            for product_name, shares in allocation_columns.items():
+                output_data[product_name] = shares
+            
+            output_df = pd.DataFrame(output_data)
 
             # Summary by Cost To
-            summary_cols = product_names
-            summary = output_df.groupby("Cost To")[summary_cols].sum().reset_index()
-            summary["Grand Total"] = summary[summary_cols].sum(axis=1)
+            product_names = [p['desc'] for p in product_items]
+            summary = output_df.groupby("Cost To")[product_names].sum().reset_index()
+            summary["Grand Total"] = summary[product_names].sum(axis=1)
             
             # Store results in session state
             st.session_state.uploaded_files['allocation_result'] = output_df
@@ -882,11 +1119,16 @@ elif page == "💰 Expense Allocation":
         else:
             st.info("💰 **Calculation excludes VAT** - Using Amount excl. tax column from invoice")
         
+        # Display grand total comparison
+        product_cols = [col for col in output_df.columns if col not in ['User name', 'Email', 'Cost To']]
+        calculated_total = output_df[product_cols].sum().sum()
+        st.metric("🧮 **Calculated Grand Total**", f"${calculated_total:,.2f}", help="Sum of all allocations - should match invoice total")
+        
         st.markdown("**Preview (first 10 rows):**")
-        st.dataframe(output_df.head(10), hide_index=True, use_container_width=True)
+        st.dataframe(output_df.head(10), hide_index=True, width="stretch")
 
         st.markdown("### 🏢 Summary by Business Unit")
-        st.dataframe(summary, hide_index=True, use_container_width=True)
+        st.dataframe(summary, hide_index=True, width="stretch")
 
         # Download buttons
         st.markdown("### 📥 Download Results")
@@ -900,7 +1142,7 @@ elif page == "💰 Expense Allocation":
                     "📊 Download Summary by BU",
                     data=buf.getvalue(),
                     file_name="Expense_Allocation_Summary.xlsx",
-                    use_container_width=True
+                    width="stretch"
                 )
 
         with col2:
@@ -914,7 +1156,7 @@ elif page == "💰 Expense Allocation":
                     data=towrite.getvalue(),
                     file_name="Expense_Allocation_Output.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    width="stretch"
                 )
 
     else:
