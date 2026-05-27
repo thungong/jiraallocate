@@ -23,11 +23,17 @@ COPY . .
 # Create uploads directory
 RUN mkdir -p uploads
 
-# Expose port
+# Expose port (Railway uses $PORT env var, fallback to 8501)
 EXPOSE 8501
 
 # Health check
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
+HEALTHCHECK CMD curl --fail http://localhost:${PORT:-8501}/_stcore/health
 
 # Run the application
-ENTRYPOINT ["streamlit", "run", "app_modern.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Railway injects $PORT dynamically; use shell form to expand the variable
+CMD streamlit run app_modern.py \
+    --server.port=${PORT:-8501} \
+    --server.address=0.0.0.0 \
+    --server.headless=true \
+    --server.enableCORS=false \
+    --server.enableXsrfProtection=false
